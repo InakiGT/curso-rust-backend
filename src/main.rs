@@ -1,44 +1,106 @@
-#[macro_use] // Se utilizarán macros
-extern crate diesel; // Se utilizará diesel de manera intensiva
+#[macro_use]
+extern crate diesel;
 
 pub mod schema;
 pub mod models;
 
+use tera::Tera;
 use dotenv::dotenv;
 use std::env;
+
 use diesel::prelude::*;
 use diesel::pg::PgConnection;
 
-fn main() {
-    dotenv().ok(); // carga del .env
+use diesel::r2d2::{self, ConnectionManager};
+use diesel::r2d2::Pool;
 
-    let db_url = env::var("DATABASE_URL").expect("db url variable not found");
+use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
 
-    let conn = PgConnection::establish(&db_url).expect("Connection refused");
+pub type DbPool = r2d2::Pool<ConnectionManager<PgConnection>>;
 
-    use self::models::{ Post };
-    // use self::schema::posts;
-    use self::schema::posts::dsl::*;
+use self::models::{ Post, NewPostHandler };
+// use self::schema::posts;
+use self::schema::posts::dsl::*;
 
-    // let new_post = NewPost {
-    //     title: "Mi segundo blogpost",
-    //     body: "Lorem ipsum sit amet",
-    //     slug: "primer-post",
-    // };
 
-    // // Insersión en BD
-    // diesel::insert_into(posts::table).values(new_post).get_result::<Post>(&conn).expect("Insertion failure");
-    // Select * from posts
+#[get("/")]
+async fn index(pool: web::Data<DbPool>, template_manager: web::Data<tera::Tera>) -> impl Responder {
+    let conn = pool.get().expect("Problemas al traer la base de datos");
 
-    let _ = diesel::update(posts.filter(id.eq(1))).set(title.eq("Mi primer blogpost")).get_results::<Post>(&conn).expect("Error en el update");
+    return match web::block(move || { posts.load::<Post>(&conn) }).await { // Bloquea el thread para evitar race-condition (Actix)
+        Ok(data) => {
+            let data = data.unwrap();
 
-    let posts_result = posts.load::<Post>(&conn).expect("Query error");
+            let mut ctx = tera::Context::new();
+            ctx.insert("posts", &data);
 
-    for post in posts_result {
-        print!("{}", post.title);
-    }
-
-    diesel::delete(posts.filter(id.eq(1))).execute(&conn).expect("Ha fallado la eliminación del post");
-
+            return HttpResponse::Ok().content_type("text/html").body(
+                template_manager.render("index.html", &ctx).unwrap()
+            );
+        },
+        Err(_) => HttpResponse::Ok().body("Error al recibir la data") 
+    };
 }
 
+#[get("/blog/{blog_slug}")]
+async fn get_post(pool: web::Data<DbPool>, template_manager: web::Data<tera::Tera>, blog_slug: web::Path<String>) -> impl Responder {
+    let conn = pool.get().expect("Problemas al traer la base de datos");
+
+    let url_slug = blog_slug.into_inner();
+
+    return match web::block(move || { posts.filter(slug.eq(url_slug)).load::<Post>(&conn) }).await { // Bloquea el thread para evitar race-condition (Actix)
+        Ok(data) => {
+            let data = data.unwrap();
+
+            if data.len() == 0 {
+                return HttpResponse::NotFound().finish();
+            }
+
+            let data = &data[0];
+
+            let mut ctx = tera::Context::new();
+            ctx.insert("post", &data);
+
+            return HttpResponse::Ok().content_type("text/html").body(
+                template_manager.render("posts.html", &ctx).unwrap()
+            );
+        },
+        Err(_) => HttpResponse::Ok().body("Error al recibir la data") 
+    };
+}
+
+#[post("/new_post")]
+async fn new_post(pool : web::Data<DbPool>, item: web::Json<NewPostHandler>) -> impl Responder {
+    let conn = pool.get().expect("Problemas al traer la base de datos");
+
+    return match web::block(move || { Post::create_post( &conn, &item ) }).await { // Bloquea el thread para evitar race-condition (Actix)
+        Ok(_) => {
+            return HttpResponse::Ok().body("Hay data");
+        },
+        Err(_) => HttpResponse::Ok().body("Error al recibir la data") 
+    };
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    dotenv().ok();
+    let db_url = env::var("DATABASE_URL").expect("db URL not found");
+    let port =  env::var("PORT").expect("PORT not found");
+    let port : u16 = port.parse().unwrap();
+
+    // Manager de conexiones
+    let connection = ConnectionManager::<PgConnection>::new(db_url); 
+
+    let pool = Pool::builder().build(connection).expect("No se pudo construir la Pool");
+
+    return HttpServer::new(move || { // move mueve el ownership del hilo donde estaba a dónde lo vamos a necesitar
+        let tera = Tera::new(concat!(env!("CARGO_MANIFEST_DIR"), "/templates/**/*")).unwrap();
+        
+        App::new()
+            .service(index)
+            .service(new_post)
+            .service(get_post)
+            .app_data(web::Data::new(pool.clone()))
+            .app_data(web::Data::new(tera))
+    }).bind(("0.0.0.0", port))?.run().await;
+}
